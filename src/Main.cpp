@@ -48,25 +48,37 @@ freely, subject to the following restrictions:
 #include <string>
 #include <cmath>
 #include <SDL.h>
+#include <SDL/SDL_image.h>
 
 #ifndef M_PI
 #define M_PI        3.14159265358979323846
 #endif
-
+#define ITER 12
+#define SEED 2
+#define MAXBOUNCES 8
+#define ROUGHNESS 2
+#define INV255 0.00392156862
+static const double INVITER = 1.0f/ITER;
+static const float nScale = 1.f/1024.f;
 /* Number of threads to use - adapt this to your platform for optimal results */
-static const int NumThreads = 16;
+static const int NumThreads = 2;
 /* Screen resolution */
-static const int GWidth  = 1280;
-static const int GHeight = 720;
+static const int GWidth  = 1024;
+static const int GHeight = 768;
 
 static const float AspectRatio = GHeight/(float)GWidth;
-static const int TileSize = 8;
+static const int TileSize = 16;
 
 static SDL_Surface *backBuffer;
+Uint32 *hdrpixels;
 static ThreadBarrier *barrier;
 
 static std::atomic<bool> doTerminate;
 static std::atomic<bool> renderHalfSize;
+
+int hdrw;
+int hdrh;
+int hdrpitch;
 
 struct BatchData {
     int id;
@@ -78,21 +90,96 @@ struct BatchData {
     VoxelOctree *tree;
 };
 
-Vec3 shade(int intNormal, const Vec3 &ray, const Vec3 &light) {
+float vectorAngle(float x, float y) {
+    if (!x) // special cases
+        return (y > 0)? 0.25
+            : (!y)? 0.f
+            : 0.75f;
+    else if (!y) // special cases
+        return (x >= 0)? 0.f
+            : 0.5f;
+    float ret = atanf(y/x) / M_PI;
+    if (x < 0 && y < 0) // quadrant Ⅲ
+        ret += 0.5f;
+    else if (x < 0) // quadrant Ⅱ
+        ret -= 0.5f; // it actually substracts
+    else if (y < 0) // quadrant Ⅳ
+        ret = 0.75f + (0.25 - ret); // it actually substracts
+    return ret;
+}
+
+Vec3 light = Vec3(-1.0, 1.0, -1.0).normalize();
+
+float hdri(Vec3 v) {
+	float vn = std::max(0.05f, light.dot(v.normalize()));
+	return vn;
+	/*int x = (int)(vectorAngle(vn.x,vn.y)*hdrw);
+	int y = (int)(hdrh*0.5*(vn.z+1));
+	int colour = hdrpixels[y*hdrh+x];
+	return Vec3((colour & 0xFF) * INV255, ((colour >> 8) & 0xFF) * INV255, ((colour >> 16) & 0xFF)*INV255);*/
+	//img location from -1 to 1 and return pixel of image
+}
+
+float falloff() {
+	float n = (rand()%1000)*0.001f;
+	return n*n; //square falloff
+}
+
+Vec3 randomVector() {
+		float z = -1.0f + static_cast <float> (rand()) /( static_cast <float> (RAND_MAX/(2.f)));
+		float v = static_cast <float> (rand()) /( static_cast <float> (RAND_MAX/(6.4258530716)));
+		float x = sin(v) * -cos(asin(z));
+		float y = cos(v) * z;
+		return Vec3(x,y,z);
+}
+
+/*Vec3 randomUnitVector() {
+	return randomVector().normalize();
+}*/
+Vec3 shade(const Vec3 pos, float t, int intNormal, const Vec3 &ray, VoxelOctree *tree) {
+    uint32 intNormal2;
+	float t2;
+	
     Vec3 n;
     float c;
     decompressMaterial(intNormal, n, c);
-
-    float d = std::max(light.dot(ray.reflect(n)), 0.0f);
-    float specular = d*d;
-
-    return c*0.9f*std::abs(light.dot(n)) + specular*0.2f;
+    Vec3 absorption = Vec3(0.6,0.6,0.6);
+   
+	Vec3 pos2 = pos + ray*t + nScale*n; 
+	Vec3 reflRay = ray - 2*n.dot(ray)*n;
+	Vec3 tcol = Vec3(0);
+	for(int i = 0; i < ITER; i++) {
+		Vec3 col = absorption;
+		int bounces = 0;
+		again:;
+		Vec3 randRay = reflRay + randomVector()*ROUGHNESS*falloff();
+		randRay -= (randRay.dot(n) > 0) ? 0: 2*n.dot(randRay)*n;
+		if(tree->raymarch(pos2, randRay, 0.0f, intNormal2, t2)) {
+			if(bounces < MAXBOUNCES) {
+				bounces++;
+				col*=absorption;
+				decompressMaterial(intNormal2, n, c);
+				pos2 += randRay*t2 + nScale*n;
+				reflRay = randRay - 2*n.dot(randRay)*n;
+				goto again;
+			}
+			else {
+				col = Vec3(0,0,0);
+			}
+		}
+		else {
+			col*=hdri(randRay);
+		}
+		tcol+=col;
+	}
+	tcol *= INVITER;
+    return tcol;
 }
 
 void renderTile(int x0, int y0, int x1, int y1, int stride, float scale, float zx, float zy, float zz,
-        const Mat4 &tform, const Vec3 &light, VoxelOctree *tree, const Vec3 &pos, float minT) {
+        const Mat4 &tform,  VoxelOctree *tree, const Vec3 &pos, float minT) {
     uint32 *buffer  = (uint32 *)backBuffer->pixels;
-    int pitch       = backBuffer->pitch;
+    int pitch       = backBuffer->pitch / 4;
 
     float dy = AspectRatio - y0*scale;
     for (int y = y0; y < y1; ++y, dy -= scale) {
@@ -101,7 +188,7 @@ void renderTile(int x0, int y0, int x1, int y1, int stride, float scale, float z
             int cornerX = x - ((x - x0) % stride);
             int cornerY = y - ((y - y0) % stride);
             if (cornerX != x || cornerY != y) {
-                buffer[x + y*pitch/4] = buffer[cornerX + cornerY*pitch/4];
+                buffer[x + y*pitch] = buffer[cornerX + cornerY*pitch];
                 continue;
             }
 
@@ -115,8 +202,9 @@ void renderTile(int x0, int y0, int x1, int y1, int stride, float scale, float z
             uint32 intNormal;
             float t;
             Vec3 col;
-            if (tree->raymarch(pos + dir*minT, dir, 0.0f, intNormal, t))
-                col = shade(intNormal, dir, light);
+            if (tree->raymarch(pos + dir*minT, dir, 0.0f, intNormal, t)) {
+                col = shade(pos,(minT+t), intNormal, dir,tree);
+            }
 
 #ifdef __APPLE__
             uint32 color =
@@ -131,7 +219,7 @@ void renderTile(int x0, int y0, int x1, int y1, int stride, float scale, float z
                 (uint32(std::min(col.z, 1.0f)*255.0) << 16) |
                 0xFF000000u;
 #endif
-            buffer[x + y*pitch/4] = color;
+            buffer[x + y*pitch] = color;
         }
     }
 }
@@ -159,8 +247,6 @@ void renderBatch(BatchData *data) {
     float zx = planeDist*tform.a13, zy = planeDist*tform.a23, zz = planeDist*tform.a33;
     float coarseScale = 2.0f*TileSize/(planeDist*GHeight);
     int stride = renderHalfSize ? 3 : 1;
-
-    Vec3 light = (tform*Vec3(-1.0, 1.0, -1.0)).normalize();
 
     std::memset((uint8 *)backBuffer->pixels + y0*backBuffer->pitch, 0, (y1 - y0)*backBuffer->pitch);
 
@@ -193,7 +279,7 @@ void renderBatch(BatchData *data) {
                     int ty0 = (y - 1)*TileSize + y0;
                     int tx1 = std::min(tx0 + TileSize, x1);
                     int ty1 = std::min(ty0 + TileSize, y1);
-                    renderTile(tx0, ty0, tx1, ty1, stride, scale, zx, zy, zz, tform, light, tree, pos,
+                    renderTile(tx0, ty0, tx1, ty1, stride, scale, zx, zy, zz, tform, tree, pos,
                             std::max(minT - 0.03f, 0.0f));
                 }
             }
@@ -203,20 +289,22 @@ void renderBatch(BatchData *data) {
 
 int renderLoop(void *threadData) {
     BatchData *data = (BatchData *)threadData;
-
-    float radius = 1.0f;
-    float pitch = 0.0f;
-    float yaw = 0.0f;
+	renderHalfSize = false;
+    float radius = 1.3f;
+    /*float pitch = 0.0f;
+    float yaw = 0.0f;*/
 
     if (data->id == 0) {
         MatrixStack::set(VIEW_STACK, Mat4::translate(Vec3(0.0f, 0.0f, -radius)));
         MatrixStack::set(MODEL_STACK, Mat4());
     }
-
+    barrier->waitPre();
+    Timer timer;
+    renderBatch(data);
+    timer.bench("Render time was ");
+    barrier->waitPost();
+    
     while (!doTerminate) {
-        barrier->waitPre();
-        renderBatch(data);
-        barrier->waitPost();
 
         if (data->id == 0) {
             if (SDL_MUSTLOCK(backBuffer))
@@ -232,7 +320,7 @@ int renderLoop(void *threadData) {
                 barrier->releaseAll();
             }
 
-            float mx = float(getMouseXSpeed());
+            /*float mx = float(getMouseXSpeed());
             float my = float(getMouseYSpeed());
             if (getMouseDown(0) && (mx != 0 || my != 0)) {
                 pitch = std::fmod(pitch - my, 360.0f);
@@ -251,13 +339,12 @@ int renderLoop(void *threadData) {
                 renderHalfSize = true;
             } else {
                 renderHalfSize = false;
-            }
-
-            if (SDL_MUSTLOCK(backBuffer))
-                SDL_LockSurface(backBuffer);
+            }*/
+            //if (SDL_MUSTLOCK(backBuffer))
+            //    SDL_LockSurface(backBuffer);
         }
     }
-
+	SDL_SaveBMP(backBuffer, "./screenshot.bmp");
     return 0;
 }
 
@@ -283,6 +370,9 @@ void printHelp() {
 
 int main(int argc, char *argv[]) {
     
+    for(int s = 0; s < SEED; s++) {
+    	rand();
+    }
     unsigned int resolution = 256;  //default resolution
     unsigned int mode = 0;          //default to generate in memory
     std::string inputFile = "";
@@ -338,7 +428,11 @@ int main(int argc, char *argv[]) {
 
         SDL_WM_SetCaption("Sparse Voxel Octrees", "Sparse Voxel Octrees");
         backBuffer = SDL_SetVideoMode(GWidth, GHeight, 32, SDL_SWSURFACE);
-
+		SDL_Surface *hdr = SDL_LoadBMP( "hdri.bmp" );
+		hdrw = hdr->w;
+		hdrh = hdr->h;
+		hdrpitch = hdr->pitch;
+		hdrpixels = (Uint32*)hdr->pixels;
         SDL_Thread *threads[NumThreads - 1];
         BatchData threadData[NumThreads];
 
@@ -363,7 +457,6 @@ int main(int argc, char *argv[]) {
 
         for (int i = 1; i < NumThreads; i++)
             threads[i - 1] = SDL_CreateThread(&renderLoop, (void *)&threadData[i]);
-
         renderLoop((void *)&threadData[0]);
 
         for (int i = 1; i < NumThreads; i++)
